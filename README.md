@@ -1,5 +1,7 @@
 # Internet Hotspot — Omarchy plugin
 
+<img src="preview.png" alt="The Internet Hotspot panel open in the Omarchy bar, showing the running toggle, SSID/password fields, and a connected device" width="720">
+
 Turns your laptop into a Wi-Fi hotspot that shares its Ethernet internet
 connection, from a bar widget. No terminal needed after install.
 
