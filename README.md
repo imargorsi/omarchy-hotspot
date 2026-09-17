@@ -3,20 +3,31 @@
 Turns your laptop into a Wi-Fi hotspot that shares its Ethernet internet
 connection, from a bar widget. No terminal needed after install.
 
+## Requirements
+
+- Omarchy 4.0+ (Quickshell-based shell plugin system)
+- NetworkManager with a Wi-Fi adapter that supports AP mode (most laptops)
+- UFW as the active firewall (Omarchy's default)
+- `dnsmasq` — NetworkManager's own optional dependency for Wi-Fi hotspot
+  sharing; `install.sh` offers to install it via `pacman` if missing
+- `polkit` (already part of Omarchy) — used for the GUI's auth prompt
+
 ## Install
 
-1. Copy (or clone) this folder into `~/.config/omarchy/plugins/`:
+1. Clone this repo into `~/.config/omarchy/plugins/`:
    ```bash
-   cp -r io.github.imargorsi.hotspot ~/.config/omarchy/plugins/
+   omarchy plugin add https://github.com/imargorsi/omarchy-hotspot.git
    ```
-2. Run the one-time setup (installs the backend CLI + a polkit policy so
-   the widget can start/stop the hotspot with a normal auth prompt instead
-   of a terminal):
+   (or `git clone https://github.com/imargorsi/omarchy-hotspot ~/.config/omarchy/plugins/io.github.imargorsi.hotspot`)
+2. **Required one-time setup** — the widget cannot start/stop the hotspot
+   until this runs; it installs the backend CLI to `/usr/local/bin/` and a
+   polkit policy so the GUI can prompt for auth like a normal desktop app
+   instead of needing a terminal:
    ```bash
    ~/.config/omarchy/plugins/io.github.imargorsi.hotspot/install.sh
    ```
-3. Add the widget to your bar (`omarchy bar` group, or edit
-   `~/.config/omarchy/shell.json` — see Omarchy's plugin docs), or just
+3. Add the widget to your bar (`omarchy bar put io.github.imargorsi.hotspot`,
+   or edit `~/.config/omarchy/shell.json` — see Omarchy's plugin docs), then
    reload plugins: `omarchy-shell shell rescanPlugins`.
 
 ## Using it
