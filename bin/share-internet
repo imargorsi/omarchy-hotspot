@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# share-internet: turn this laptop into a Wi-Fi hotspot fed by its Ethernet connection.
+set -euo pipefail
+
+CONFIG_DIR="/etc/share-internet"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_FILE="$CONFIG_DIR/state"
+STATUS_FILE="/run/share-internet-status.json"
+CONN_NAME="Omarchy-Hotspot"
+NFT_TABLE="share_internet_nat"
+
+# --- self-elevate ---------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    exec sudo -E "$0" "$@"
+fi
+
+log()  { echo ">> $*"; }
+err()  { echo "ERROR: $*" >&2; }
+
+# Minimal JSON string escaping (backslash, quote, control chars).
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="$(printf '%s' "$s" | tr -d '\000-\037')"
+    printf '%s' "$s"
+}
+
+# Emits a JSON array of {mac,ip,hostname} for each current DHCP lease on
+# the given Wi-Fi interface. Safe to call as root only (lease file is
+# root-owned); callers must already be root.
+clients_json() {
+    local wifi_if="$1" leases="/var/lib/NetworkManager/dnsmasq-${1}.leases"
+    local out="[]"
+    if [[ -f "$leases" ]]; then
+        out="["
+        local first=1
+        while read -r _expiry mac ip hostname _clientid; do
+            [[ -z "$mac" ]] && continue
+            [[ "$hostname" == "*" ]] && hostname=""
+            [[ $first -eq 1 ]] || out+=","
+            first=0
+            out+="{\"mac\":\"$(json_escape "$mac")\",\"ip\":\"$(json_escape "$ip")\",\"hostname\":\"$(json_escape "$hostname")\"}"
+        done < "$leases"
+        out+="]"
+    fi
+    printf '%s' "$out"
+}
+
+# Writes a world-readable status snapshot so the GUI plugin can poll
+# state without needing root for every read (only start/stop/configure
+# need elevation). Only ever called as root.
+write_status_file() {
+    local running="$1" ssid="" password="" eth_if="" wifi_if="" clients="[]" client_count=0
+
+    [[ -f "$CONFIG_FILE" ]] && { local SSID="" PASSWORD=""; source "$CONFIG_FILE"; ssid="$SSID"; password="$PASSWORD"; }
+    if [[ -f "$STATE_FILE" ]]; then
+        local ETH_IF="" WIFI_IF=""
+        source "$STATE_FILE"
+        eth_if="$ETH_IF"; wifi_if="$WIFI_IF"
+    fi
+    if [[ "$running" == "true" && -n "$wifi_if" ]]; then
+        clients=$(clients_json "$wifi_if")
+        client_count=$(printf '%s' "$clients" | grep -o '"mac"' | wc -l)
+    fi
+
+    mkdir -p "$(dirname "$STATUS_FILE")"
+    cat > "$STATUS_FILE" <<EOF
+{
+  "running": $running,
+  "ssid": "$(json_escape "$ssid")",
+  "password": "$(json_escape "$password")",
+  "ethIf": "$(json_escape "$eth_if")",
+  "wifiIf": "$(json_escape "$wifi_if")",
+  "clientCount": $client_count,
+  "clients": $clients,
+  "ipForward": "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)",
+  "updatedAt": $(date +%s)
+}
+EOF
+    chmod 644 "$STATUS_FILE"
+}
+
+# --- config (SSID / password), created with sensible defaults on first run
+load_or_create_config() {
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        local gen_pass
+        gen_pass=$(openssl rand -hex 8)
+        cat > "$CONFIG_FILE" <<EOF
+# share-internet configuration. Edit and re-run "share-internet restart" to apply.
+SSID="Omarchy-Internet"
+PASSWORD="$gen_pass"
+EOF
+        chmod 600 "$CONFIG_FILE"
+    fi
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    if [[ -z "${SSID:-}" || -z "${PASSWORD:-}" ]]; then
+        err "SSID/PASSWORD missing from $CONFIG_FILE"
+        exit 1
+    fi
+    if [[ ${#PASSWORD} -lt 8 ]]; then
+        err "PASSWORD in $CONFIG_FILE must be at least 8 characters (WPA2 requirement)"
+        exit 1
+    fi
+}
+
+detect_eth_if() {
+    nmcli -t -f DEVICE,TYPE,STATE device status | awk -F: '$2=="ethernet" && $3=="connected" && !f{print $1; f=1}'
+}
+
+detect_wifi_if() {
+    nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi" && !f{print $1; f=1}'
+}
+
+is_active() {
+    nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx "$CONN_NAME"
+}
+
+print_credentials() {
+    echo
+    echo "  SSID:     $SSID"
+    echo "  Password: $PASSWORD"
+    echo
+    echo "  (edit $CONFIG_FILE to change these, then run: share-internet restart)"
+    echo
+}
+
+do_start() {
+    load_or_create_config
+
+    local already_active=0
+    is_active && already_active=1
+
+    local eth_if wifi_if
+    eth_if=$(detect_eth_if)
+    wifi_if=$(detect_wifi_if)
+
+    if [[ -z "$eth_if" ]]; then
+        err "No connected Ethernet interface found. Plug in Ethernet first."
+        exit 1
+    fi
+    if [[ -z "$wifi_if" ]]; then
+        err "No Wi-Fi interface found on this system."
+        exit 1
+    fi
+    log "Ethernet (internet source): $eth_if"
+    log "Wi-Fi (hotspot radio):      $wifi_if"
+
+    # Unblock Wi-Fi radio if soft-blocked
+    if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: yes"; then
+        log "Unblocking Wi-Fi radio (rfkill)"
+        rfkill unblock wifi
+    fi
+
+    # Remember what Wi-Fi client connection (if any) was active, to restore on
+    # stop. If we're already running (a live SSID/password change), keep the
+    # original values already recorded rather than re-detecting our own AP.
+    local prev_wifi_conn="" prev_ip_forward="0"
+    if [[ $already_active -eq 1 && -f "$STATE_FILE" ]]; then
+        local PREV_WIFI_CONN="" PREV_IP_FORWARD=""
+        source "$STATE_FILE"
+        prev_wifi_conn="$PREV_WIFI_CONN"; prev_ip_forward="$PREV_IP_FORWARD"
+    else
+        prev_wifi_conn=$(nmcli -t -f DEVICE,NAME connection show --active 2>/dev/null | awk -F: -v d="$wifi_if" -v c="$CONN_NAME" '$1==d && $2!=c && !f{print $2; f=1}')
+        prev_ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    cat > "$STATE_FILE" <<EOF
+ETH_IF="$eth_if"
+WIFI_IF="$wifi_if"
+PREV_WIFI_CONN="${prev_wifi_conn:-}"
+PREV_IP_FORWARD="$prev_ip_forward"
+EOF
+    chmod 600 "$STATE_FILE"
+
+    # Firewall: allow forwarding wifi -> ethernet, and allow DHCP/DNS to reach
+    # dnsmasq's own listening sockets on wlo1 (INPUT chain, separate from FORWARD)
+    log "Allowing forwarded traffic ($wifi_if -> $eth_if) via ufw"
+    ufw route allow in on "$wifi_if" out on "$eth_if" >/dev/null
+    log "Allowing DHCP/DNS to the hotspot on $wifi_if via ufw"
+    ufw allow in on "$wifi_if" to any port 67 proto udp >/dev/null
+    ufw allow in on "$wifi_if" to any port 53 proto udp >/dev/null
+    ufw allow in on "$wifi_if" to any port 53 proto tcp >/dev/null
+    ufw reload >/dev/null
+
+    # NAT: dedicated nft table, independent of whatever NM/ufw do on their own
+    log "Setting up NAT (masquerade) on $eth_if"
+    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    nft add table inet "$NFT_TABLE"
+    nft add chain inet "$NFT_TABLE" postrouting '{ type nat hook postrouting priority 100 ; }'
+    nft add rule inet "$NFT_TABLE" postrouting oifname "$eth_if" masquerade
+
+    # Enable IP forwarding (live only; restored on stop)
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    # Create/refresh the NM hotspot connection profile
+    log "Configuring Wi-Fi AP '$SSID' on $wifi_if"
+    nmcli connection delete "$CONN_NAME" >/dev/null 2>&1 || true
+    nmcli connection add type wifi ifname "$wifi_if" con-name "$CONN_NAME" autoconnect no ssid "$SSID" >/dev/null
+    nmcli connection modify "$CONN_NAME" \
+        802-11-wireless.mode ap \
+        802-11-wireless.band bg \
+        ipv4.method shared \
+        ipv6.method disabled \
+        wifi-sec.key-mgmt wpa-psk \
+        wifi-sec.proto rsn \
+        wifi-sec.pairwise ccmp \
+        wifi-sec.group ccmp \
+        wifi-sec.psk "$PASSWORD"
+
+    log "Starting hotspot"
+    nmcli connection up "$CONN_NAME" ifname "$wifi_if" >/dev/null
+
+    log "Hotspot is up."
+    print_credentials
+    write_status_file "true"
+}
+
+do_stop() {
+    if [[ ! -f "$STATE_FILE" ]] && ! is_active; then
+        log "Hotspot is not running."
+        return 0
+    fi
+
+    local eth_if="" wifi_if="" prev_wifi_conn="" prev_ip_forward="0"
+    if [[ -f "$STATE_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$STATE_FILE"
+        eth_if="$ETH_IF"; wifi_if="$WIFI_IF"
+        prev_wifi_conn="$PREV_WIFI_CONN"; prev_ip_forward="$PREV_IP_FORWARD"
+    else
+        wifi_if=$(detect_wifi_if)
+    fi
+
+    log "Stopping hotspot"
+    nmcli connection down "$CONN_NAME" >/dev/null 2>&1 || true
+
+    if [[ -n "$wifi_if" ]]; then
+        log "Removing firewall rules"
+        ufw delete allow in on "$wifi_if" to any port 67 proto udp >/dev/null 2>&1 || true
+        ufw delete allow in on "$wifi_if" to any port 53 proto udp >/dev/null 2>&1 || true
+        ufw delete allow in on "$wifi_if" to any port 53 proto tcp >/dev/null 2>&1 || true
+        if [[ -n "$eth_if" ]]; then
+            ufw route delete allow in on "$wifi_if" out on "$eth_if" >/dev/null 2>&1 || true
+        fi
+        ufw reload >/dev/null 2>&1 || true
+    fi
+
+    log "Removing NAT table"
+    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+
+    log "Restoring IP forwarding to previous state ($prev_ip_forward)"
+    sysctl -w net.ipv4.ip_forward="$prev_ip_forward" >/dev/null
+
+    if [[ -n "$prev_wifi_conn" ]]; then
+        log "Reconnecting previous Wi-Fi network: $prev_wifi_conn"
+        nmcli connection up "$prev_wifi_conn" >/dev/null 2>&1 || log "  (could not reconnect automatically, connect manually if needed)"
+    fi
+
+    rm -f "$STATE_FILE"
+    log "Hotspot stopped. Normal networking restored."
+    write_status_file "false"
+}
+
+do_status() {
+    if is_active; then
+        # shellcheck disable=SC1090
+        [[ -f "$STATE_FILE" ]] && source "$STATE_FILE"
+        echo "Hotspot: RUNNING"
+        [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" && echo "SSID:    $SSID"
+        [[ -n "${WIFI_IF:-}" ]] && echo "Wi-Fi:   $WIFI_IF"
+        [[ -n "${ETH_IF:-}" ]] && echo "Ethernet: $ETH_IF (internet source)"
+        local clients
+        clients=$(iw dev "${WIFI_IF:-}" station dump 2>/dev/null | grep -c '^Station' || true)
+        echo "Connected clients: ${clients:-0}"
+        echo "IP forwarding: $(cat /proc/sys/net/ipv4/ip_forward)"
+        nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && echo "NAT table: present" || echo "NAT table: MISSING"
+        write_status_file "true"
+    else
+        echo "Hotspot: STOPPED"
+        write_status_file "false"
+    fi
+}
+
+do_configure() {
+    local new_ssid="$1" new_password="$2"
+    if [[ -z "$new_ssid" || -z "$new_password" ]]; then
+        err "Usage: share-internet configure <ssid> <password>"
+        exit 1
+    fi
+    if [[ ${#new_password} -lt 8 ]]; then
+        err "Password must be at least 8 characters (WPA2 requirement)"
+        exit 1
+    fi
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    # %q shell-quotes the values so arbitrary user-typed SSID/password text
+    # (quotes, $, backticks, ...) can't inject code into the later `source`.
+    {
+        echo '# share-internet configuration. Edit and re-run "share-internet restart" to apply.'
+        printf 'SSID=%q\n' "$new_ssid"
+        printf 'PASSWORD=%q\n' "$new_password"
+    } > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    log "Saved new SSID/password."
+    if is_active; then
+        log "Hotspot is running; applying new settings now."
+        do_start
+    fi
+}
+
+case "${1:-start}" in
+    start)     do_start ;;
+    stop)      do_stop ;;
+    restart)   do_stop || true; do_start ;;
+    status)    do_status ;;
+    configure) shift; do_configure "${1:-}" "${2:-}" ;;
+    *)
+        echo "Usage: share-internet [start|stop|restart|status|configure <ssid> <password>]"
+        exit 1
+        ;;
+esac

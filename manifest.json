@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.imargorsi.hotspot",
+  "name": "Internet Hotspot",
+  "version": "1.0.0",
+  "author": "AR Gorsi",
+  "license": "MIT",
+  "description": "Share your Ethernet internet over Wi-Fi with one click. Editable SSID/password and a live connected-devices list.",
+  "homepage": "https://github.com/imargorsi/omarchy-hotspot",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Internet Hotspot",
+    "description": "Toggle a Wi-Fi hotspot fed by your Ethernet connection; edit SSID/password and see connected devices.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Status refresh interval while panel is open (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Internet Hotspot (Omarchy plugin)</vendor>
+  <vendor_url>https://github.com/imargorsi/omarchy-hotspot</vendor_url>
+  <icon_name>network-wireless-hotspot</icon_name>
+
+  <action id="io.github.imargorsi.hotspot.manage">
+    <description>Manage the Internet Hotspot (start, stop, or change its SSID/password)</description>
+    <message>Authentication is required to manage the Wi-Fi hotspot</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/share-internet</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>
