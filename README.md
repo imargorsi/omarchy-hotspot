@@ -20,17 +20,51 @@ connection, from a bar widget. No terminal needed after install.
    ```bash
    omarchy plugin add https://github.com/imargorsi/omarchy-hotspot.git
    ```
-   (or `git clone https://github.com/imargorsi/omarchy-hotspot ~/.config/omarchy/plugins/io.github.imargorsi.hotspot`)
 2. **Required one-time setup** — the widget cannot start/stop the hotspot
    until this runs; it installs the backend CLI to `/usr/local/bin/` and a
    polkit policy so the GUI can prompt for auth like a normal desktop app
-   instead of needing a terminal:
+   instead of needing a terminal. The helper runs as root, so read
+   `bin/share-internet` and `install.sh` first. `install.sh` lists what it
+   will install, and asks before installing `dnsmasq`:
    ```bash
    ~/.config/omarchy/plugins/io.github.imargorsi.hotspot/install.sh
    ```
 3. Add the widget to your bar (`omarchy bar put io.github.imargorsi.hotspot`,
    or edit `~/.config/omarchy/shell.json` — see Omarchy's plugin docs), then
    reload plugins: `omarchy-shell shell rescanPlugins`.
+
+## Uninstall
+
+1. Stop the hotspot and remove everything `install.sh` set up (the helper,
+   the polkit policy, `/etc/share-internet`, the saved NetworkManager
+   profile). It leaves the plugin folder and `dnsmasq` alone:
+   ```bash
+   ~/.config/omarchy/plugins/io.github.imargorsi.hotspot/uninstall.sh
+   ```
+2. Remove the plugin itself (this also removes its bar widget):
+   ```bash
+   omarchy plugin remove io.github.imargorsi.hotspot
+   ```
+3. Optional: `sudo pacman -R dnsmasq` if you installed it only for this.
+
+## What it changes on your system
+
+Only while the hotspot is running (all of it is undone by **stop**):
+
+- A NetworkManager connection named `Omarchy-Hotspot` (AP mode, WPA2) on
+  your Wi-Fi interface. Your previous Wi-Fi connection is reconnected on stop.
+- UFW rules: forward Wi-Fi → Ethernet, and allow DHCP/DNS (UDP 67, UDP/TCP
+  53) in on the Wi-Fi interface. Stop deletes these same rules, so an
+  identical rule you added yourself beforehand would be removed too.
+- A separate `nft` NAT table `share_internet_nat` (masquerade on Ethernet).
+- `net.ipv4.ip_forward=1`, restored to its previous value on stop.
+- Wi-Fi is unblocked with `rfkill` if it was soft-blocked.
+
+Persistent files: `/usr/local/bin/share-internet`,
+`/usr/share/polkit-1/actions/io.github.imargorsi.hotspot.policy`,
+`/etc/share-internet/` (SSID/password/state, root-only), and the
+NetworkManager profile. Nothing in your own configuration
+(`~/.config`, `shell.json`, UFW's defaults) is edited by the plugin.
 
 ## Using it
 
@@ -49,7 +83,10 @@ connection, from a bar widget. No terminal needed after install.
   opens the minimum UFW firewall rules needed (forwarding + DHCP/DNS input),
   and manages its own NAT table. Installed to `/usr/local/bin/share-internet`
   by `install.sh`. Also fully usable directly from a terminal:
-  `share-internet [start|stop|restart|status|configure <ssid> <password>]`.
+  `share-internet [start|stop|restart|status|credentials|configure <ssid>]`
+  (`configure` reads the new password from stdin, e.g.
+  `echo 'new password' | share-internet configure MyNetwork`, or prompts
+  for it on a terminal).
 - `io.github.imargorsi.hotspot.policy` — a polkit policy naming that exact
   script, installed to `/usr/share/polkit-1/actions/`. This is what lets the
   bar widget call `pkexec /usr/local/bin/share-internet ...` and get a
@@ -57,10 +94,12 @@ connection, from a bar widget. No terminal needed after install.
   instead of failing the way a plain `sudo` would from a GUI context.
 - The backend writes a **world-readable** status snapshot to
   `/run/share-internet-status.json` on every start/stop/status call
-  (SSID, running state, connected clients — nothing that needs root to
-  read). `Service.qml` watches that file, so the bar/panel update live
-  without needing a password prompt for every refresh. Only actions that
-  change something (start/stop/configure) go through `pkexec`.
+  (SSID, running state, connected clients — **never the password**).
+  `Service.qml` watches that file, so the bar/panel update live. The
+  password is fetched separately, only while the panel is open, via
+  `pkexec share-internet credentials` (returned on the pipe's stdout, kept
+  in memory only). Only actions that change something
+  (start/stop/configure) go through `pkexec` otherwise.
 - `Service.qml` / `BarWidget.qml` / `Panel.qml` — the QML side: bar icon,
   popup panel, editable SSID/password, connected-devices list.
 
@@ -78,21 +117,23 @@ connection, from a bar widget. No terminal needed after install.
 This is designed for a personal, single-user laptop, not a shared/multi-user
 machine. Trade-offs made deliberately for a simple, no-daemon design:
 
-- `/run/share-internet-status.json` is world-readable (0644) and includes the
-  current hotspot password in plaintext, so the bar widget can poll status
-  without a password prompt on every refresh. Any other local user on the
-  same machine could read it.
-- `/etc/share-internet/config` (the persisted SSID/password) is root-only
-  (0600).
-- `configure <ssid> <password>` passes the new password as a CLI argument to
-  the privileged helper, which is briefly visible to other local users via
-  `ps`/`/proc/<pid>/cmdline`.
+- The Wi-Fi password is never written to `/run/share-internet-status.json`
+  (world-readable, 0644) and never passed as a command-line argument.
+  A new password is sent to the privileged helper on **stdin**, and the
+  helper puts it into the NetworkManager profile through a root-only
+  (0600) keyfile rather than `nmcli ... wifi-sec.psk <password>`, so it is
+  never visible in `ps` or `/proc/<pid>/cmdline`. The panel's **Copy**
+  button pipes the password to `wl-copy` on stdin for the same reason.
+- `/etc/share-internet/config` (the persisted SSID/password) and the
+  `/etc/NetworkManager/system-connections/Omarchy-Hotspot.nmconnection`
+  profile are root-only (0600).
+- The status snapshot still lists connected clients (hostname/IP/MAC) to
+  every local user.
 
 If you're adapting this for a shared machine, don't — or at least tighten
 these before you do.
 
-### Known gotchas (found the hard way — see git history / commit messages
-if publishing, or just keep this list updated)
+### Implementation notes
 
 - UFW forwarding rules must go through the real `ufw` CLI
   (`ufw route allow ...` + `ufw reload`) — hand-editing
@@ -106,19 +147,6 @@ if publishing, or just keep this list updated)
 - `dnsmasq` itself must be installed (`pacman -Qi networkmanager` lists it
   as an optional dep for connection sharing) — without it NM hotspot
   activation fails with "IP configuration could not be reserved."
-
-## Publishing this as a public plugin
-
-This was built and tested locally first. To publish:
-
-```bash
-cd ~/.config/omarchy/plugins/io.github.imargorsi.hotspot
-git init && git add -A && git commit -m "Initial release"
-gh repo create imargorsi/omarchy-hotspot --public --source=. --push
-```
-
-Then update `homepage` in `manifest.json` and `vendor_url` in the `.policy`
-file if the repo name differs from the placeholder used here.
 
 ## License
 

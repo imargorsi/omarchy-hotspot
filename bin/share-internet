@@ -8,10 +8,11 @@ STATE_FILE="$CONFIG_DIR/state"
 STATUS_FILE="/run/share-internet-status.json"
 CONN_NAME="Omarchy-Hotspot"
 NFT_TABLE="share_internet_nat"
+NM_PROFILE="/etc/NetworkManager/system-connections/$CONN_NAME.nmconnection"
 
 # --- self-elevate ---------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-    exec sudo -E "$0" "$@"
+    exec sudo "$0" "$@"
 fi
 
 log()  { echo ">> $*"; }
@@ -49,11 +50,12 @@ clients_json() {
 
 # Writes a world-readable status snapshot so the GUI plugin can poll
 # state without needing root for every read (only start/stop/configure
-# need elevation). Only ever called as root.
+# need elevation). Only ever called as root. It must never contain the
+# Wi-Fi password -- that is only handed out by `credentials`, over stdout.
 write_status_file() {
-    local running="$1" ssid="" password="" eth_if="" wifi_if="" clients="[]" client_count=0
+    local running="$1" ssid="" eth_if="" wifi_if="" clients="[]" client_count=0
 
-    [[ -f "$CONFIG_FILE" ]] && { local SSID="" PASSWORD=""; source "$CONFIG_FILE"; ssid="$SSID"; password="$PASSWORD"; }
+    [[ -f "$CONFIG_FILE" ]] && { local SSID="" PASSWORD=""; source "$CONFIG_FILE"; ssid="$SSID"; }
     if [[ -f "$STATE_FILE" ]]; then
         local ETH_IF="" WIFI_IF=""
         source "$STATE_FILE"
@@ -61,15 +63,15 @@ write_status_file() {
     fi
     if [[ "$running" == "true" && -n "$wifi_if" ]]; then
         clients=$(clients_json "$wifi_if")
-        client_count=$(printf '%s' "$clients" | grep -o '"mac"' | wc -l)
+        client_count=$(printf '%s' "$clients" | { grep -o '"mac"' || true; } | wc -l)
     fi
 
-    mkdir -p "$(dirname "$STATUS_FILE")"
-    cat > "$STATUS_FILE" <<EOF
+    # Write to a temp file and rename, so a reader never sees a half-written file.
+    local tmp="$STATUS_FILE.tmp"
+    cat > "$tmp" <<EOF
 {
   "running": $running,
   "ssid": "$(json_escape "$ssid")",
-  "password": "$(json_escape "$password")",
   "ethIf": "$(json_escape "$eth_if")",
   "wifiIf": "$(json_escape "$wifi_if")",
   "clientCount": $client_count,
@@ -78,7 +80,8 @@ write_status_file() {
   "updatedAt": $(date +%s)
 }
 EOF
-    chmod 644 "$STATUS_FILE"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$STATUS_FILE"
 }
 
 # --- config (SSID / password), created with sensible defaults on first run
@@ -88,11 +91,12 @@ load_or_create_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         local gen_pass
         gen_pass=$(openssl rand -hex 8)
-        cat > "$CONFIG_FILE" <<EOF
+        (umask 077; cat > "$CONFIG_FILE" <<EOF
 # share-internet configuration. Edit and re-run "share-internet restart" to apply.
 SSID="Omarchy-Internet"
 PASSWORD="$gen_pass"
 EOF
+        )
         chmod 600 "$CONFIG_FILE"
     fi
     # shellcheck disable=SC1090
@@ -126,6 +130,59 @@ print_credentials() {
     echo
     echo "  (edit $CONFIG_FILE to change these, then run: share-internet restart)"
     echo
+}
+
+# Escapes a value for an NM keyfile string: backslashes, and leading/trailing
+# spaces (which the keyfile parser would otherwise strip).
+keyfile_escape() {
+    local v="${1//\\/\\\\}"
+    [[ "$v" == " "* ]] && v="\\s${v# }"
+    [[ "$v" == *" " ]] && v="${v% }\\s"
+    printf '%s' "$v"
+}
+
+# Writes the hotspot's NetworkManager profile as a root-only (0600) keyfile.
+# The PSK goes into that file, never onto a command line: `nmcli ... wifi-sec.psk
+# "$PASSWORD"` would expose it to every local user via /proc/<pid>/cmdline.
+write_nm_profile() {
+    local wifi_if="$1" ssid_bytes psk tmp
+    # SSID as decimal bytes: no escaping edge cases, and NM accepts it verbatim.
+    ssid_bytes=$(printf '%s' "$SSID" | od -An -v -tu1 | tr -s ' \n' ';')
+    ssid_bytes="${ssid_bytes#;}"
+    psk=$(keyfile_escape "$PASSWORD")
+    tmp="$(dirname "$NM_PROFILE")/.$CONN_NAME.tmp"
+    (
+        umask 077
+        cat > "$tmp" <<EOF
+[connection]
+id=$CONN_NAME
+uuid=$(cat /proc/sys/kernel/random/uuid)
+type=wifi
+autoconnect=false
+interface-name=$wifi_if
+
+[wifi]
+mode=ap
+band=bg
+ssid=$ssid_bytes
+
+[wifi-security]
+key-mgmt=wpa-psk
+proto=rsn;
+pairwise=ccmp;
+group=ccmp;
+psk=$psk
+
+[ipv4]
+method=shared
+
+[ipv6]
+method=disabled
+EOF
+    )
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$NM_PROFILE"
+    nmcli connection reload
 }
 
 do_start() {
@@ -200,17 +257,7 @@ EOF
     # Create/refresh the NM hotspot connection profile
     log "Configuring Wi-Fi AP '$SSID' on $wifi_if"
     nmcli connection delete "$CONN_NAME" >/dev/null 2>&1 || true
-    nmcli connection add type wifi ifname "$wifi_if" con-name "$CONN_NAME" autoconnect no ssid "$SSID" >/dev/null
-    nmcli connection modify "$CONN_NAME" \
-        802-11-wireless.mode ap \
-        802-11-wireless.band bg \
-        ipv4.method shared \
-        ipv6.method disabled \
-        wifi-sec.key-mgmt wpa-psk \
-        wifi-sec.proto rsn \
-        wifi-sec.pairwise ccmp \
-        wifi-sec.group ccmp \
-        wifi-sec.psk "$PASSWORD"
+    write_nm_profile "$wifi_if"
 
     log "Starting hotspot"
     nmcli connection up "$CONN_NAME" ifname "$wifi_if" >/dev/null
@@ -286,25 +333,54 @@ do_status() {
     fi
 }
 
+# Hands the current SSID/password to the caller over stdout only (a pipe to
+# whoever ran us), so the GUI can show/copy it without it ever touching a
+# world-readable file.
+do_credentials() {
+    local SSID="" PASSWORD=""
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+    printf '{"ssid":"%s","password":"%s"}\n' "$(json_escape "$SSID")" "$(json_escape "$PASSWORD")"
+}
+
+# The new password is read from stdin, never argv: command-line arguments are
+# visible to every local user through ps and /proc/<pid>/cmdline.
 do_configure() {
-    local new_ssid="$1" new_password="$2"
-    if [[ -z "$new_ssid" || -z "$new_password" ]]; then
-        err "Usage: share-internet configure <ssid> <password>"
+    local new_ssid="${1:-}" new_password=""
+    if [[ $# -gt 1 ]]; then
+        err "The password must be given on stdin, not as an argument (arguments are visible in ps)."
+        err "Usage: echo 'new password' | share-internet configure <ssid>"
         exit 1
     fi
-    if [[ ${#new_password} -lt 8 ]]; then
-        err "Password must be at least 8 characters (WPA2 requirement)"
+    if [[ -t 0 ]]; then
+        read -r -s -p "New password: " new_password || true
+        echo >&2
+    else
+        IFS= read -r new_password || true
+    fi
+    if [[ -z "$new_ssid" || -z "$new_password" ]]; then
+        err "Usage: echo 'new password' | share-internet configure <ssid>"
+        exit 1
+    fi
+    if [[ $(printf '%s' "$new_ssid" | wc -c) -gt 32 ]]; then
+        err "SSID must be at most 32 bytes"
+        exit 1
+    fi
+    if ! LC_ALL=C grep -qE '^[[:print:]]{8,63}$' <<<"$new_password"; then
+        err "Password must be 8-63 printable ASCII characters (WPA2 requirement)"
         exit 1
     fi
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
     # %q shell-quotes the values so arbitrary user-typed SSID/password text
     # (quotes, $, backticks, ...) can't inject code into the later `source`.
-    {
-        echo '# share-internet configuration. Edit and re-run "share-internet restart" to apply.'
-        printf 'SSID=%q\n' "$new_ssid"
-        printf 'PASSWORD=%q\n' "$new_password"
-    } > "$CONFIG_FILE"
+    (
+        umask 077
+        {
+            echo '# share-internet configuration. Edit and re-run "share-internet restart" to apply.'
+            printf 'SSID=%q\n' "$new_ssid"
+            printf 'PASSWORD=%q\n' "$new_password"
+        } > "$CONFIG_FILE"
+    )
     chmod 600 "$CONFIG_FILE"
     log "Saved new SSID/password."
     if is_active; then
@@ -314,13 +390,15 @@ do_configure() {
 }
 
 case "${1:-start}" in
-    start)     do_start ;;
-    stop)      do_stop ;;
-    restart)   do_stop || true; do_start ;;
-    status)    do_status ;;
-    configure) shift; do_configure "${1:-}" "${2:-}" ;;
+    start)       do_start ;;
+    stop)        do_stop ;;
+    restart)     do_stop || true; do_start ;;
+    status)      do_status ;;
+    credentials) do_credentials ;;
+    configure)   shift; do_configure "$@" ;;
     *)
-        echo "Usage: share-internet [start|stop|restart|status|configure <ssid> <password>]"
+        echo "Usage: share-internet [start|stop|restart|status|credentials|configure <ssid>]"
+        echo "       (configure reads the new password from stdin)"
         exit 1
         ;;
 esac

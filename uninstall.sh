@@ -10,6 +10,7 @@ fi
 
 sudo rm -f /usr/local/bin/share-internet
 sudo rm -f /usr/share/polkit-1/actions/io.github.imargorsi.hotspot.policy
+sudo nmcli connection delete Omarchy-Hotspot >/dev/null 2>&1 || true
 sudo rm -rf /etc/share-internet
 sudo rm -f /run/share-internet-status.json
 

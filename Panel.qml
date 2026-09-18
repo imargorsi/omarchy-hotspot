@@ -44,7 +44,7 @@ Panel {
   }
 
   function open() {
-    if (service) { service.panelOpen = true; service.checkInstalled(); service.refreshStatus() }
+    if (service) { service.panelOpen = true; service.checkInstalled(); service.refreshCredentials() }
     _syncDraftFromService()
     setCenterHoverRevealSuppressed(false)
     root.controller.show()
@@ -237,7 +237,7 @@ Panel {
               tooltipText: "Copy password"
               foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: Quickshell.execDetached(["wl-copy", "--", root.draftPassword])
+              onClicked: if (service) service.copyToClipboard(root.draftPassword)
             }
           }
 

@@ -25,6 +25,9 @@ fi
 sudo install -m 755 "$DIR/bin/share-internet" /usr/local/bin/share-internet
 sudo install -m 644 "$DIR/io.github.imargorsi.hotspot.policy" \
     /usr/share/polkit-1/actions/io.github.imargorsi.hotspot.policy
+# Older versions put the Wi-Fi password in this world-readable snapshot;
+# drop any leftover copy (the helper recreates it, without the password).
+sudo rm -f /run/share-internet-status.json
 
 echo
 echo "Done. Reload the plugin (omarchy-shell shell rescanPlugins, or just"

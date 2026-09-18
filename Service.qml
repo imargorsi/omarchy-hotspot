@@ -9,7 +9,10 @@ import qs.Commons
 // omarchy-shell's own polkit agent, with `auth_admin_keep` caching so the
 // user isn't re-prompted on every click). Read-only status comes from a
 // world-readable JSON snapshot the backend writes on every run, watched here
-// via FileView so the UI updates the instant the file changes.
+// via FileView so the UI updates the instant the file changes. That snapshot
+// deliberately holds no secrets: the Wi-Fi password is fetched separately
+// (`credentials`, over the pkexec pipe's stdout) and a new one is sent to the
+// helper on stdin -- never argv, which any local user can read via ps.
 Item {
   id: root
 
@@ -35,7 +38,6 @@ Item {
       var s = JSON.parse(txt)
       root.running = !!s.running
       root.ssid = String(s.ssid || "")
-      root.password = String(s.password || "")
       root.wifiIf = String(s.wifiIf || "")
       root.ethIf = String(s.ethIf || "")
       root.clientCount = s.clientCount || 0
@@ -70,22 +72,33 @@ Item {
     id: actionProcess
     running: false
     command: []
+    stdinEnabled: true
     stdout: StdioCollector { id: actionStdout; waitForEnd: true }
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
+    onStarted: {
+      if (root._stdinPayload !== "") write(root._stdinPayload)
+      root._stdinPayload = ""
+    }
     onExited: function (exitCode) {
       root.busy = false
+      root._stdinPayload = ""
       if (exitCode !== 0) {
         var err = String(actionStderr.text || "").trim()
         root.lastError = err !== "" ? err : "Command failed (exit " + exitCode + ")"
       } else {
         root.lastError = ""
+        // Only while the panel is open: no background password prompts.
+        if (root.panelOpen) root.refreshCredentials()
       }
       statusFile.reload()
       root.checkInstalled()
     }
   }
 
-  function _runPkexec(args) {
+  // Data to feed the next action's stdin (the new Wi-Fi password).
+  property string _stdinPayload: ""
+
+  function _runPkexec(args, stdinData) {
     if (busy) return
     if (!installed) {
       lastError = "Not installed yet — run install.sh once (see README)."
@@ -93,6 +106,7 @@ Item {
     }
     busy = true
     lastError = ""
+    _stdinPayload = stdinData || ""
     actionProcess.command = ["pkexec", helperPath].concat(args)
     actionProcess.running = true
   }
@@ -107,7 +121,24 @@ Item {
     var p = String(newPassword || "")
     if (s === "") { lastError = "SSID can't be empty."; return }
     if (p.length < 8) { lastError = "Password must be at least 8 characters."; return }
-    _runPkexec(["configure", s, p])
+    if (p.indexOf("\n") !== -1) { lastError = "Password can't contain a line break."; return }
+    _runPkexec(["configure", s], p + "\n")
+  }
+
+  // Copies text to the Wayland clipboard. wl-copy stays alive holding the
+  // selection, so the text must not be on its command line (visible to every
+  // local user via ps): it goes in through the environment (owner-only in
+  // /proc) and is piped to wl-copy's stdin, with the variable unset first.
+  Process {
+    id: copyProcess
+    running: false
+    command: ["sh", "-c", 'pw=$HOTSPOT_COPY_TEXT; unset HOTSPOT_COPY_TEXT; printf %s "$pw" | wl-copy']
+  }
+
+  function copyToClipboard(text) {
+    if (copyProcess.running || !text) return
+    copyProcess.environment = { HOTSPOT_COPY_TEXT: String(text) }
+    copyProcess.running = true
   }
 
   // Refresh (as root, so the client list / live state is current) only
@@ -116,14 +147,52 @@ Item {
     id: refreshProcess
     running: false
     command: []
-    onExited: function () { statusFile.reload() }
+    onExited: function () {
+      statusFile.reload()
+      root._pumpCredentials()
+    }
   }
 
   function refreshStatus() {
-    if (!installed || busy || refreshProcess.running) return
+    if (!installed || busy || refreshProcess.running || credentialsProcess.running || _credentialsPending) return
     refreshProcess.command = ["pkexec", helperPath, "status"]
     refreshProcess.running = true
   }
+
+  // The current password, fetched from the root helper on stdout. It lives
+  // only in this process's memory. Status polling and this fetch never run
+  // at the same time, so the first auth prompt isn't shown twice.
+  property bool _credentialsPending: false
+
+  Process {
+    id: credentialsProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: credentialsStdout; waitForEnd: true }
+    onExited: function (exitCode) {
+      if (exitCode === 0) {
+        try {
+          var c = JSON.parse(String(credentialsStdout.text || ""))
+          root.password = String(c.password || "")
+        } catch (e) {}
+      }
+      root.refreshStatus()
+    }
+  }
+
+  function refreshCredentials() {
+    _credentialsPending = true
+    _pumpCredentials()
+  }
+
+  function _pumpCredentials() {
+    if (!_credentialsPending || !installed || busy || refreshProcess.running || credentialsProcess.running) return
+    _credentialsPending = false
+    credentialsProcess.command = ["pkexec", helperPath, "credentials"]
+    credentialsProcess.running = true
+  }
+
+  onInstalledChanged: if (installed && panelOpen) refreshCredentials()
 
   Timer {
     interval: Math.max(2, root.pollIntervalSec) * 1000
