@@ -9,7 +9,8 @@ connection, from a bar widget. No terminal needed after install.
 
 - Omarchy 4.0+ (Quickshell-based shell plugin system)
 - NetworkManager with a Wi-Fi adapter that supports AP mode (most laptops)
-- UFW as the active firewall (Omarchy's default)
+- `nftables` (`nft`) for the NAT rule, and UFW as the firewall (Omarchy's
+  default; if `ufw` isn't installed its rules are simply skipped)
 - `dnsmasq` — NetworkManager's own optional dependency for Wi-Fi hotspot
   sharing; `install.sh` offers to install it via `pacman` if missing
 - `polkit` (already part of Omarchy) — used for the GUI's auth prompt
@@ -92,14 +93,15 @@ NetworkManager profile. Nothing in your own configuration
   bar widget call `pkexec /usr/local/bin/share-internet ...` and get a
   proper graphical auth prompt (via omarchy-shell's own polkit agent)
   instead of failing the way a plain `sudo` would from a GUI context.
-- The backend writes a **world-readable** status snapshot to
-  `/run/share-internet-status.json` on every start/stop/status call
-  (SSID, running state, connected clients — **never the password**).
-  `Service.qml` watches that file, so the bar/panel update live. The
-  password is fetched separately, only while the panel is open, via
-  `pkexec share-internet credentials` (returned on the pipe's stdout, kept
-  in memory only). Only actions that change something
-  (start/stop/configure) go through `pkexec` otherwise.
+- The backend writes a status snapshot to `/run/share-internet-status.json`
+  on every start/stop/status call (SSID, running state, connected clients —
+  **never the password**). The file is owned by the user who ran the action
+  and mode 0600. `Service.qml` watches it, so the bar/panel update live.
+  The password is fetched separately, only while the panel is open, via
+  `pkexec share-internet credentials` (returned on the pipe's stdout, held
+  in memory, and dropped when the panel closes). While the panel is open it
+  also refreshes the live client list with `pkexec share-internet status`;
+  polling stops if you cancel the auth prompt.
 - `Service.qml` / `BarWidget.qml` / `Panel.qml` — the QML side: bar icon,
   popup panel, editable SSID/password, connected-devices list.
 
@@ -118,7 +120,7 @@ This is designed for a personal, single-user laptop, not a shared/multi-user
 machine. Trade-offs made deliberately for a simple, no-daemon design:
 
 - The Wi-Fi password is never written to `/run/share-internet-status.json`
-  (world-readable, 0644) and never passed as a command-line argument.
+  and never passed as a command-line argument.
   A new password is sent to the privileged helper on **stdin**, and the
   helper puts it into the NetworkManager profile through a root-only
   (0600) keyfile rather than `nmcli ... wifi-sec.psk <password>`, so it is
@@ -127,8 +129,14 @@ machine. Trade-offs made deliberately for a simple, no-daemon design:
 - `/etc/share-internet/config` (the persisted SSID/password) and the
   `/etc/NetworkManager/system-connections/Omarchy-Hotspot.nmconnection`
   profile are root-only (0600).
-- The status snapshot still lists connected clients (hostname/IP/MAC) to
-  every local user.
+- The status snapshot (connected clients' hostname/IP/MAC) is readable only
+  by the user who ran the action (0600), not by other local accounts.
+- The panel's **Copy** button puts the password on the Wayland clipboard,
+  so a clipboard-history manager may keep a copy of it.
+- Changing the hotspot needs an administrator password (polkit
+  `auth_admin_keep`), the same as `sudo`.
+- If starting fails partway (for example `dnsmasq` is missing), the firewall,
+  NAT and forwarding changes are rolled back.
 
 If you're adapting this for a shared machine, don't — or at least tighten
 these before you do.

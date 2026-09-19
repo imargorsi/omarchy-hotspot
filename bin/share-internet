@@ -18,6 +18,17 @@ fi
 log()  { echo ">> $*"; }
 err()  { echo "ERROR: $*" >&2; }
 
+# start/stop need these; fail with a clear message instead of a bare exit code.
+require_cmds() {
+    local c
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || { err "Required command not found: $c"; exit 1; }
+    done
+}
+
+# UFW is Omarchy's default firewall, but only touch it if it is present.
+have_ufw() { command -v ufw >/dev/null 2>&1; }
+
 # Minimal JSON string escaping (backslash, quote, control chars).
 json_escape() {
     local s="$1"
@@ -48,10 +59,11 @@ clients_json() {
     printf '%s' "$out"
 }
 
-# Writes a world-readable status snapshot so the GUI plugin can poll
-# state without needing root for every read (only start/stop/configure
-# need elevation). Only ever called as root. It must never contain the
-# Wi-Fi password -- that is only handed out by `credentials`, over stdout.
+# Writes a status snapshot the GUI plugin can read without root (only
+# start/stop/configure need elevation). It is owned by the user who invoked
+# us (pkexec/sudo) and mode 0600, so other local accounts can't read the
+# connected-client list. It must never contain the Wi-Fi password -- that is
+# only handed out by `credentials`, over stdout. Only ever called as root.
 write_status_file() {
     local running="$1" ssid="" eth_if="" wifi_if="" clients="[]" client_count=0
 
@@ -80,7 +92,11 @@ write_status_file() {
   "updatedAt": $(date +%s)
 }
 EOF
-    chmod 644 "$tmp"
+    chmod 600 "$tmp"
+    # Hand the file to whoever ran us through pkexec/sudo. With no such user
+    # (e.g. a root shell) it stays root-only, which is the safe failure mode.
+    local owner="${PKEXEC_UID:-${SUDO_UID:-}}"
+    [[ "$owner" =~ ^[0-9]+$ ]] && chown "$owner" "$tmp"
     mv -f "$tmp" "$STATUS_FILE"
 }
 
@@ -90,7 +106,7 @@ load_or_create_config() {
     chmod 700 "$CONFIG_DIR"
     if [[ ! -f "$CONFIG_FILE" ]]; then
         local gen_pass
-        gen_pass=$(openssl rand -hex 8)
+        gen_pass=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
         (umask 077; cat > "$CONFIG_FILE" <<EOF
 # share-internet configuration. Edit and re-run "share-internet restart" to apply.
 SSID="Omarchy-Internet"
@@ -186,6 +202,7 @@ EOF
 }
 
 do_start() {
+    require_cmds nmcli nft sysctl
     load_or_create_config
 
     local already_active=0
@@ -236,13 +253,17 @@ EOF
 
     # Firewall: allow forwarding wifi -> ethernet, and allow DHCP/DNS to reach
     # dnsmasq's own listening sockets on wlo1 (INPUT chain, separate from FORWARD)
-    log "Allowing forwarded traffic ($wifi_if -> $eth_if) via ufw"
-    ufw route allow in on "$wifi_if" out on "$eth_if" >/dev/null
-    log "Allowing DHCP/DNS to the hotspot on $wifi_if via ufw"
-    ufw allow in on "$wifi_if" to any port 67 proto udp >/dev/null
-    ufw allow in on "$wifi_if" to any port 53 proto udp >/dev/null
-    ufw allow in on "$wifi_if" to any port 53 proto tcp >/dev/null
-    ufw reload >/dev/null
+    if have_ufw; then
+        log "Allowing forwarded traffic ($wifi_if -> $eth_if) via ufw"
+        ufw route allow in on "$wifi_if" out on "$eth_if" >/dev/null
+        log "Allowing DHCP/DNS to the hotspot on $wifi_if via ufw"
+        ufw allow in on "$wifi_if" to any port 67 proto udp >/dev/null
+        ufw allow in on "$wifi_if" to any port 53 proto udp >/dev/null
+        ufw allow in on "$wifi_if" to any port 53 proto tcp >/dev/null
+        ufw reload >/dev/null
+    else
+        log "ufw not installed; skipping firewall rules"
+    fi
 
     # NAT: dedicated nft table, independent of whatever NM/ufw do on their own
     log "Setting up NAT (masquerade) on $eth_if"
@@ -260,7 +281,15 @@ EOF
     write_nm_profile "$wifi_if"
 
     log "Starting hotspot"
-    nmcli connection up "$CONN_NAME" ifname "$wifi_if" >/dev/null
+    local up_err
+    if ! up_err=$(nmcli connection up "$CONN_NAME" ifname "$wifi_if" 2>&1 >/dev/null); then
+        err "Could not start the hotspot: ${up_err:-nmcli failed}"
+        err "(is dnsmasq installed, and does the Wi-Fi adapter support AP mode?)"
+        # Undo the firewall/NAT/forwarding changes made above rather than
+        # leaving them applied to a hotspot that never came up.
+        do_stop >/dev/null 2>&1 || true
+        exit 1
+    fi
 
     log "Hotspot is up."
     print_credentials
@@ -273,7 +302,7 @@ do_stop() {
         return 0
     fi
 
-    local eth_if="" wifi_if="" prev_wifi_conn="" prev_ip_forward="0"
+    local eth_if="" wifi_if="" prev_wifi_conn="" prev_ip_forward=""
     if [[ -f "$STATE_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$STATE_FILE"
@@ -286,7 +315,7 @@ do_stop() {
     log "Stopping hotspot"
     nmcli connection down "$CONN_NAME" >/dev/null 2>&1 || true
 
-    if [[ -n "$wifi_if" ]]; then
+    if [[ -n "$wifi_if" ]] && have_ufw; then
         log "Removing firewall rules"
         ufw delete allow in on "$wifi_if" to any port 67 proto udp >/dev/null 2>&1 || true
         ufw delete allow in on "$wifi_if" to any port 53 proto udp >/dev/null 2>&1 || true
@@ -300,8 +329,12 @@ do_stop() {
     log "Removing NAT table"
     nft delete table inet "$NFT_TABLE" 2>/dev/null || true
 
-    log "Restoring IP forwarding to previous state ($prev_ip_forward)"
-    sysctl -w net.ipv4.ip_forward="$prev_ip_forward" >/dev/null
+    # Without a state file we don't know the original value; leave it alone
+    # rather than guess (forcing 0 could break Docker/VMs).
+    if [[ -n "$prev_ip_forward" ]]; then
+        log "Restoring IP forwarding to previous state ($prev_ip_forward)"
+        sysctl -w net.ipv4.ip_forward="$prev_ip_forward" >/dev/null
+    fi
 
     if [[ -n "$prev_wifi_conn" ]]; then
         log "Reconnecting previous Wi-Fi network: $prev_wifi_conn"

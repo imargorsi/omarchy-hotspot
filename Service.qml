@@ -8,9 +8,9 @@ import qs.Commons
 // (a polkit policy names the exact helper + shows a proper auth prompt via
 // omarchy-shell's own polkit agent, with `auth_admin_keep` caching so the
 // user isn't re-prompted on every click). Read-only status comes from a
-// world-readable JSON snapshot the backend writes on every run, watched here
-// via FileView so the UI updates the instant the file changes. That snapshot
-// deliberately holds no secrets: the Wi-Fi password is fetched separately
+// owner-only (0600) JSON snapshot the backend writes on every run, watched
+// here via FileView so the UI updates the instant the file changes. That
+// snapshot deliberately holds no secrets: the Wi-Fi password is fetched separately
 // (`credentials`, over the pkexec pipe's stdout) and a new one is sent to the
 // helper on stdin -- never argv, which any local user can read via ps.
 Item {
@@ -31,6 +31,10 @@ Item {
   property string lastError: ""
   property bool panelOpen: false
   property int pollIntervalSec: 5
+  // Set when the user dismisses or fails the auth prompt, so polling stops
+  // instead of re-showing the dialog every few seconds. Cleared on the next
+  // deliberate action (opening the panel, start/stop/save).
+  property bool authDeclined: false
 
   function _applyStatusJson(txt) {
     if (!txt || txt === "") return
@@ -84,7 +88,11 @@ Item {
       root._stdinPayload = ""
       if (exitCode !== 0) {
         var err = String(actionStderr.text || "").trim()
-        root.lastError = err !== "" ? err : "Command failed (exit " + exitCode + ")"
+        if (exitCode === 126 || exitCode === 127) {
+          root.lastError = "Authentication was cancelled or denied."
+        } else {
+          root.lastError = err !== "" ? err : "Command failed (exit " + exitCode + ")"
+        }
       } else {
         root.lastError = ""
         // Only while the panel is open: no background password prompts.
@@ -106,6 +114,7 @@ Item {
     }
     busy = true
     lastError = ""
+    authDeclined = false
     _stdinPayload = stdinData || ""
     actionProcess.command = ["pkexec", helperPath].concat(args)
     actionProcess.running = true
@@ -147,14 +156,15 @@ Item {
     id: refreshProcess
     running: false
     command: []
-    onExited: function () {
+    onExited: function (exitCode) {
+      if (exitCode === 126 || exitCode === 127) root.authDeclined = true
       statusFile.reload()
       root._pumpCredentials()
     }
   }
 
   function refreshStatus() {
-    if (!installed || busy || refreshProcess.running || credentialsProcess.running || _credentialsPending) return
+    if (!installed || busy || authDeclined || refreshProcess.running || credentialsProcess.running || _credentialsPending) return
     refreshProcess.command = ["pkexec", helperPath, "status"]
     refreshProcess.running = true
   }
@@ -175,14 +185,23 @@ Item {
           var c = JSON.parse(String(credentialsStdout.text || ""))
           root.password = String(c.password || "")
         } catch (e) {}
+      } else if (exitCode === 126 || exitCode === 127) {
+        root.authDeclined = true
       }
       root.refreshStatus()
     }
   }
 
   function refreshCredentials() {
+    authDeclined = false
     _credentialsPending = true
     _pumpCredentials()
+  }
+
+  // Drops the fetched password so it only lives in memory while the panel is open.
+  function clearCredentials() {
+    _credentialsPending = false
+    password = ""
   }
 
   function _pumpCredentials() {
@@ -197,7 +216,7 @@ Item {
   Timer {
     interval: Math.max(2, root.pollIntervalSec) * 1000
     repeat: true
-    running: root.panelOpen && root.installed
+    running: root.panelOpen && root.installed && !root.authDeclined
     triggeredOnStart: true
     onTriggered: root.refreshStatus()
   }

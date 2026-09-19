@@ -52,9 +52,10 @@ Panel {
   }
 
   function close() {
-    if (service) service.panelOpen = false
+    if (service) { service.panelOpen = false; service.clearCredentials() }
     // Discard unsaved edits so reopening shows the real, saved state.
     dirty = false
+    passwordRevealed = false
     _syncDraftFromService()
     setCenterHoverRevealSuppressed(false)
     root.controller.hide()
