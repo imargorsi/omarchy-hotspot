@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.imargorsi.hotspot",
   "name": "Internet Hotspot",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "AR Gorsi",
   "license": "MIT",
   "description": "Share your Ethernet internet over Wi-Fi with one click. Editable SSID/password and a live connected-devices list.",

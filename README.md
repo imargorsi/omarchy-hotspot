@@ -30,6 +30,9 @@ connection, from a bar widget. No terminal needed after install.
    ```bash
    ~/.config/omarchy/plugins/io.github.imargorsi.hotspot/install.sh
    ```
+   Root never reads the plugin folder (see [How the installer stays safe
+   against tampering](#how-the-installer-stays-safe-against-tampering)); it
+   installs a checksum-verified copy.
 3. Add the widget to your bar (`omarchy bar put io.github.imargorsi.hotspot`,
    or edit `~/.config/omarchy/shell.json` — see Omarchy's plugin docs), then
    reload plugins: `omarchy-shell shell rescanPlugins`.
@@ -110,8 +113,11 @@ NetworkManager profile. Nothing in your own configuration
 - **UI tweaks**: edit `BarWidget.qml` / `Panel.qml` directly; Quickshell
   hot-reloads on save (see Omarchy's plugin docs — save anywhere under
   `~/.config/omarchy/plugins/` reloads automatically).
-- **Backend/firewall logic**: edit `bin/share-internet`, then re-run
-  `install.sh` to push the updated copy to `/usr/local/bin/`.
+- **Backend/firewall logic**: edit `bin/share-internet`, update the pinned
+  `HELPER_SHA256` in `install.sh` (`sha256sum bin/share-internet`), then
+  re-run `install.sh` to push the updated copy to `/usr/local/bin/`. The
+  same applies to the `.policy` file and `POLICY_SHA256`. `install.sh`
+  refuses to install a file that doesn't match its pin.
 - **Uninstall everything this plugin set up**: `./uninstall.sh`.
 
 ## Security notes
@@ -140,6 +146,36 @@ machine. Trade-offs made deliberately for a simple, no-daemon design:
 
 If you're adapting this for a shared machine, don't — or at least tighten
 these before you do.
+
+### How the installer stays safe against tampering
+
+`install.sh` is the only script that copies anything into a root-owned
+location (`uninstall.sh` only removes fixed paths and reads nothing from the
+plugin folder), and it is built so that **root never opens a file in the plugin folder** (which any
+process running as you can write to):
+
+1. `install.sh` reads `bin/share-internet` and the polkit policy **once**,
+   into memory, before it asks for sudo, and checks them against the SHA-256
+   values pinned in the script.
+2. It then makes a **single** `sudo` call and hands those in-memory bytes to
+   root as arguments. The pinned checksums travel in the same command line,
+   so nothing can change them once sudo has started.
+3. The root-side code decodes the bytes into a fresh root-only (`0700`)
+   staging directory under `/run`, **re-verifies the SHA-256 itself**,
+   installs from staging as `root:root` with an atomic rename, and deletes
+   the staging directory. A mismatch aborts before anything is installed.
+
+So swapping `bin/share-internet` or the policy while the sudo password
+prompt is open has no effect on what gets installed. The script also refuses
+to run as root, and is written so that editing `install.sh` while it runs
+can't change its behaviour.
+
+What this does *not* protect against: someone who can already edit files in
+your plugin folder **before** you run `install.sh` (a compromised checkout).
+That is why the script tells you what it will install and prints the
+checksums, and why you should read it first. After install, `pkexec` only
+runs `/usr/local/bin/share-internet` (root-owned, in a root-owned directory)
+and the helper only reads root-owned state under `/etc/share-internet`.
 
 ### Implementation notes
 
